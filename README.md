@@ -10,72 +10,97 @@ Successfully demonstrated June 2026: 5 N contact force, 0.02 m/s wipe speed,
 
 ## Architecture
 
-```
-                    ┌──────────────────────┐
-                    │     wipe_node        │
-                    │     ("brain")        │
-                    │                      │
-                    │  ┌────────────────┐  │
-                    │  │  State Machine │  │
-                    │  │                │  │
-         ~/start   │  │  IDLE          │  │
-        ─────────► │  │    │           │  │
-                    │  │    ▼           │  │
-                    │  │  APPROACH     │  │
-                    │  │    │ fz < -2N  │  │
-                    │  │    ▼           │  │
-                    │  │  WIPE         │  │
-                    │  │    │ complete  │  │
-                    │  │    ▼           │  │
-                    │  │  RETRACT      │  │
-                    │  │    │ timeout   │  │
-                    │  │    ▼           │  │
-                    │  │  IDLE         │  │
-                    │  └────────────────┘  │
-                    │                      │
-                    │  WipeTrajectory      │
-                    │  (zigzag X/Y)        │
-                    └──────────┬───────────┘
-                               │
-                    WipeSetpoint (50 Hz)
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   admittance_node    │
-  /wrench_raw ───► │   ("executor")       │
-  (500 Hz)         │                      │
-                    │  PI Force Control    │
-                    │  (Z-axis, Kp=0.001   │
-                    │   Ki=0.01)           │
-                    │                      │
-                    │  Orientation Hold    │
-                    │  (quaternion, all    │
-                    │   modes)            │
-                    └──────────┬───────────┘
-                               │
-                    SendTwistCommand (~13 Hz)
-                               │
-                               ▼
-                    ┌──────────────────────┐
-                    │   Kinova Gen3 Arm    │
-                    └──────────────────────┘
+```mermaid
+flowchart TB
+    subgraph brain["🧠 wipe_node (brain)"]
+        direction TB
+        SRV["~/start service"] --> SM
+
+        subgraph SM["State Machine"]
+            direction TB
+            IDLE["⏸️ IDLE"] -->|"~/start"| APPROACH
+            APPROACH["⬇️ APPROACH\nvz = -0.01 m/s"] -->|"Fz < -2N\n(contact!)"| WIPE
+            WIPE["🧹 WIPE\nPI force + zigzag"] -->|"trajectory\ncomplete"| RETRACT
+            RETRACT["⬆️ RETRACT\nvz = +0.02 m/s"] -->|"timeout\n1.0s"| IDLE2["⏸️ IDLE"]
+        end
+
+        TRAJ["WipeTrajectory\n(zigzag X/Y generator)"]
+    end
+
+    subgraph msg["📨 WipeSetpoint @ 50Hz"]
+        SP["mode | z_force_control\nforce_desired_z\nvelocity_x/y/z"]
+    end
+
+    subgraph executor["⚙️ admittance_node (executor)"]
+        direction TB
+        PI["PI Force Controller\nKp=0.001  Ki=0.01\nvz = -(Kp·e + Ki·∫e)"]
+        OH["Quaternion Orientation Hold\n(active in ALL modes)"]
+        SAFE["Safety Clamp\nv < 0.15 m/s"]
+        SEND["SendTwistCommand\n(~13Hz, base frame)"]
+
+        PI --> OH --> SAFE --> SEND
+    end
+
+    subgraph sensor["🔧 MAE SensuReal"]
+        FT["/wrench_raw @ 500Hz"]
+    end
+
+    subgraph hw["🦾 Kinova Gen3"]
+        ARM["Internal 1kHz Servo"]
+    end
+
+    SM --> msg
+    TRAJ -.->|"vx, vy"| msg
+    msg --> executor
+    FT -->|"gravity comp\nEMA filter\ndead zone"| executor
+    FT -.->|"/wrench_corrected"| brain
+    SEND --> ARM
+
+    style brain fill:#2a4365,stroke:#63b3ed,color:#e2e8f0
+    style msg fill:#744210,stroke:#ecc94b,color:#fefcbf
+    style executor fill:#22543d,stroke:#68d391,color:#e2e8f0
+    style sensor fill:#553c9a,stroke:#b794f4,color:#e2e8f0
+    style hw fill:#1a365d,stroke:#4299e1,color:#e2e8f0
 ```
 
 ## How It Works
 
-**IDLE → APPROACH:** User calls `~/start`. The arm descends at `approach_speed`
-(default 0.01 m/s). The wipe_node monitors `wrench_corrected` Fz from the
-admittance node.
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant W as wipe_node
+    participant A as admittance_node
+    participant K as Kinova Gen3
 
-**APPROACH → WIPE:** Contact detected when `Fz < -contact_threshold` (default
--2 N). The wipe_node commands force control mode: Z-axis handed to the PI
-controller (target: `force_desired` N), X/Y driven by the zigzag trajectory
-generator at `wipe_speed` m/s.
+    U->>W: ~/start service call
+    W->>W: State → APPROACH
 
-**WIPE → RETRACT:** Trajectory complete (all passes done). The arm lifts at
-`retract_speed` for `retract_duration` seconds.
+    loop Every 20ms (50Hz)
+        W->>A: WipeSetpoint (APPROACH, vz=-0.01)
+        A->>K: SendTwistCommand (descend)
+    end
 
-**RETRACT → IDLE:** Retract timer expires. Ready for next run.
+    Note over A: Fz crosses -2N threshold
+    A-->>W: /wrench_corrected (Fz < -2N)
+    W->>W: State → WIPE
+
+    loop Every 20ms (50Hz)
+        W->>A: WipeSetpoint (WIPE, force=5N, vx/vy=zigzag)
+        A->>A: PI: vz = -(Kp·e + Ki·∫e)
+        A->>K: SendTwistCommand (force + lateral)
+    end
+
+    Note over W: Trajectory complete
+    W->>W: State → RETRACT
+
+    loop Every 20ms (50Hz)
+        W->>A: WipeSetpoint (RETRACT, vz=+0.02)
+        A->>K: SendTwistCommand (lift off)
+    end
+
+    Note over W: Retract timeout
+    W->>W: State → IDLE
+```
 
 ## Sign Convention
 
